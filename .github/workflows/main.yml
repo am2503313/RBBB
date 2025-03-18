@@ -1,0 +1,80 @@
+name: Persistent Windows RDP
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: '45 5 * * *'  # Runs at 5:45 UTC daily (for demo, adjust as needed)
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 349  # Just under 6 hours (GitHub max is 6 hours)
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Download ngrok
+        run: Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+        
+      - name: Extract ngrok
+        run: Expand-Archive ngrok.zip
+        
+      - name: Auth ngrok
+        run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          
+      - name: Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
+          
+      - name: Set Password
+        run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
+        
+      - name: Create and Save Connection Info
+        run: |
+          # Get public IP for reference
+          $publicIP = (Invoke-WebRequest -uri "https://api.ipify.org/").Content
+          echo "Public IP: $publicIP" > connection_info.txt
+          
+          # Start ngrok in background and save the URL
+          Start-Process -FilePath .\ngrok\ngrok.exe -ArgumentList "tcp 3389" -RedirectStandardOutput ngrok_output.txt -NoNewWindow
+          
+          # Give ngrok a moment to establish connection
+          Start-Sleep -Seconds 5
+          
+          # Extract connection info and save it
+          $ngrokOutput = Get-Content ngrok_output.txt
+          $connectionURL = $ngrokOutput | Select-String -Pattern "url=.+" | ForEach-Object { $_.Matches.Value }
+          echo "Connection: $connectionURL" >> connection_info.txt
+          
+          # Upload the connection info to artifact
+          echo "::notice::RDP is ready! Check the workflow artifacts for connection details."
+          
+      - name: Upload Connection Info
+        uses: actions/upload-artifact@v3
+        with:
+          name: RDP-Connection-Info
+          path: connection_info.txt
+          
+      - name: Keep alive
+        run: |
+          # Keep the job running until timeout
+          $timeout = [DateTime]::Now.AddMinutes(345)  # ~5h 45m
+          while ([DateTime]::Now -lt $timeout) {
+            echo "RDP session active. Remaining time: $(($timeout - [DateTime]::Now).ToString('hh\:mm\:ss'))"
+            Start-Sleep -Seconds 300  # Status update every 5 minutes
+          }
+          
+      - name: Trigger next workflow
+        if: always()  # Run even if the previous steps fail
+        run: |
+          # Use GitHub CLI to trigger a new workflow run
+          gh workflow run "Persistent Windows RDP" --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
